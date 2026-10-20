@@ -1,0 +1,1173 @@
+#!/usr/bin/env bash
+# shepherd — inspect and terminate processes spawned by Claude Code's
+# Bash tool. See README for the full story.
+set -u
+
+CC_VERSION="0.5.0"
+
+# ---- library resolution ------------------------------------------------------
+
+cc_resolve_self() {
+  local s="$1"
+  # Follow symlinks iteratively (macOS readlink has no -f).
+  while [ -L "$s" ]; do
+    local target; target=$(readlink "$s")
+    case "$target" in
+      /*) s="$target" ;;
+      *)  s="$(dirname "$s")/$target" ;;
+    esac
+  done
+  ( cd "$(dirname "$s")" && pwd )
+}
+
+cc_find_root() {
+  [ -n "${CC_ROOT:-}" ] && [ -d "$CC_ROOT/lib" ] && { echo "$CC_ROOT"; return; }
+  # Plugin-mode: Claude Code sets CLAUDE_PLUGIN_ROOT when invoking hook scripts.
+  if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$CLAUDE_PLUGIN_ROOT/lib/detect.sh" ]; then
+    ( cd "$CLAUDE_PLUGIN_ROOT" && pwd ); return
+  fi
+  local bindir; bindir=$(cc_resolve_self "$0")
+  local candidates=(
+    "$bindir/.."
+    "$bindir/../share/shepherd"
+    "$HOME/.local/share/shepherd"
+    "/usr/local/share/shepherd"
+    "/opt/homebrew/share/shepherd"
+  )
+  local d
+  for d in "${candidates[@]}"; do
+    if [ -f "$d/lib/detect.sh" ]; then ( cd "$d" && pwd ); return; fi
+  done
+  return 1
+}
+
+CC_ROOT=$(cc_find_root) || {
+  echo "shepherd: cannot locate lib/ directory" >&2
+  exit 1
+}
+
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/detect.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/tree.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/kill.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/track.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/config.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/history.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/stash.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/portparse.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/awareness.sh"
+# shellcheck source=/dev/null
+. "$CC_ROOT/lib/units.sh"
+
+# ---- helpers ----------------------------------------------------------------
+
+cc_short_id() {
+  # First 6 chars of a session id — readable in output.
+  printf '%s' "${1:0:6}"
+}
+# cc_session_live_pids now lives in lib/track.sh (needed by lib/awareness.sh).
+
+# Shorter printer used by `list` — one indented line per process.
+cc_print_process_line() {
+  local pid="$1"
+  local info
+  info=$(cc_process_info "$pid")
+  [ -z "$info" ] && return 0
+  local cmd rss etime ports
+  IFS=$'\t' read -r _ cmd rss etime ports <<< "$info"
+  if [ "${#cmd}" -gt 32 ]; then cmd="${cmd:0:29}..."; fi
+
+  # Port/label column: prefer a recognised dev-server label over raw port.
+  local label=""
+  if [ -n "$ports" ]; then
+    label=$(cc_label_devserver "$cmd" "$ports")
+    [ -z "$label" ] && label="port $ports"
+  fi
+
+  local fd; fd=$(cc_fd_count "$pid")
+  printf '  %-7s %-32s %-20s %-7s %-5s FD %s\n' \
+    "$pid" "$cmd" "$label" \
+    "$(cc_format_rss "$rss")" "$(cc_format_etime "$etime")" "$fd"
+}
+
+# ---- subcommand: list -------------------------------------------------------
+
+cmd_list() {
+  local only_session="" only_orphans=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) only_session="$2"; shift 2 ;;
+      --session=*) only_session="${1#--session=}"; shift ;;
+      --orphans) only_orphans=1; shift ;;
+      -h|--help) cc_usage_list; return 0 ;;
+      *) echo "shepherd list: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+
+  cc_state_init
+  cc_have_jq || { echo "shepherd: jq is required" >&2; return 1; }
+
+  local any_output=0
+  local sessions
+  if [ -n "$only_session" ]; then
+    sessions="$only_session"
+  else
+    sessions=$(cc_session_list)
+  fi
+
+  if [ "$only_orphans" -eq 0 ]; then
+    local id
+    while IFS= read -r id; do
+      [ -z "$id" ] && continue
+      local claude_pid cwd
+      claude_pid=$(cc_session_claude_pid "$id")
+      cwd=$(cc_session_cwd "$id")
+      # Only show sessions whose claude is alive (orphans go in the orphan block)
+      if cc_is_claude_alive "$claude_pid"; then
+        local live_pids
+        live_pids=$(cc_session_live_pids "$id")
+        local state_hint="active"
+        # If no wrapper currently alive, report the session as idle with age
+        # of latest spawn (roughly: etime of oldest live tracked pid).
+        if [ -n "$live_pids" ]; then
+          # If any wrapper signature is in ps with this claude as PPID → active
+          if [ -z "$(cc_find_wrappers_for_claude "$claude_pid")" ]; then
+            state_hint="idle"
+          fi
+        fi
+        printf 'SESSION  %s  %s  (claude pid %s, %s)\n' \
+          "$(cc_short_id "$id")" "${cwd:-?}" "$claude_pid" "$state_hint"
+        if [ -n "$live_pids" ]; then
+          local p
+          while IFS= read -r p; do cc_print_process_line "$p"; done <<< "$live_pids"
+        else
+          echo "  (no background processes)"
+        fi
+        echo
+        any_output=1
+      fi
+    done <<< "$sessions"
+  fi
+
+  # Orphans: sessions whose claude_pid is NOT alive but which still have live
+  # tracked PIDs.
+  local orphan_lines=""
+  local id
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    local claude_pid
+    claude_pid=$(cc_session_claude_pid "$id")
+    if ! cc_is_claude_alive "$claude_pid"; then
+      local live_pids
+      live_pids=$(cc_session_live_pids "$id")
+      if [ -n "$live_pids" ]; then
+        local p
+        while IFS= read -r p; do
+          local line; line=$(cc_print_process_line "$p")
+          [ -n "$line" ] && orphan_lines+="$line"$'\n'
+        done <<< "$live_pids"
+      fi
+    fi
+  done <<< "$sessions"
+
+  if [ -n "$orphan_lines" ]; then
+    echo "ORPHANS  (no live claude ancestor)"
+    printf '%s' "$orphan_lines"
+    any_output=1
+  elif [ "$only_orphans" -eq 1 ]; then
+    echo "No orphaned processes."
+    any_output=1
+  fi
+
+  if [ "$any_output" -eq 0 ]; then
+    echo "No tracked Claude-spawned processes."
+  fi
+}
+
+cc_usage_list() {
+  cat <<'EOF'
+Usage: shepherd list [--session <id>] [--orphans]
+
+Show Claude-spawned background processes, grouped by session. Orphans are
+processes whose originating Claude process is no longer alive.
+EOF
+}
+
+# ---- subcommand: status -----------------------------------------------------
+
+cmd_status() {
+  cc_state_init
+  cc_have_jq || { echo "shepherd: jq is required" >&2; return 1; }
+
+  local sessions=0 active=0 procs=0 orphans=0
+  local id
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    sessions=$((sessions + 1))
+    local claude_pid live_pids count
+    claude_pid=$(cc_session_claude_pid "$id")
+    live_pids=$(cc_session_live_pids "$id")
+    count=$(printf '%s\n' "$live_pids" | awk 'NF' | wc -l | awk '{print $1}')
+    if cc_is_claude_alive "$claude_pid"; then
+      active=$((active + 1))
+      procs=$((procs + count))
+    else
+      orphans=$((orphans + count))
+    fi
+  done < <(cc_session_list)
+
+  printf '%d sessions (%d active), %d processes, %d orphans\n' \
+    "$sessions" "$active" "$procs" "$orphans"
+}
+
+# ---- subcommand: kill -------------------------------------------------------
+
+cmd_kill() {
+  local mode="pid" target="" grace=3
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) mode="session"; target="$2"; shift 2 ;;
+      --session=*) mode="session"; target="${1#--session=}"; shift ;;
+      --orphans) mode="orphans"; shift ;;
+      --all)     mode="all"; shift ;;
+      --latest)  mode="latest"; shift ;;
+      --grace) grace="$2"; shift 2 ;;
+      -h|--help) cc_usage_kill; return 0 ;;
+      -*) echo "shepherd kill: unknown flag: $1" >&2; return 2 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+
+  cc_state_init
+  cc_have_jq || { echo "shepherd: jq is required" >&2; return 1; }
+
+  # No target and no explicit flag → default: kill the latest tracked pid.
+  if [ "$mode" = "pid" ] && [ -z "$target" ]; then
+    mode="latest"
+  fi
+
+  local rc=0
+  case "$mode" in
+    latest)
+      local latest; latest=$(cc_latest_tracked_pid)
+      if [ -z "$latest" ]; then
+        echo "no tracked processes to kill"
+        return 0
+      fi
+      echo "killing latest tracked pid $latest + descendants..."
+      cc_kill_tree "$latest" "$grace" || rc=1
+      cc_history_append killed "" "$latest" "" "user-kill-latest" "" 2>/dev/null || true
+      ;;
+    pid)
+      if ! cc_is_alive "$target"; then
+        echo "pid $target is not alive"
+        return 0
+      fi
+      echo "killing $target + descendants..."
+      cc_kill_tree "$target" "$grace" || rc=1
+      cc_history_append killed "" "$target" "" "user-kill-pid" "" 2>/dev/null || true
+      ;;
+    session)
+      [ -z "$target" ] && { cc_usage_kill; return 2; }
+      local roots; roots=$(cc_session_all_pids "$target")
+      if [ -z "$roots" ]; then
+        echo "no tracked processes for session $target"
+        return 0
+      fi
+      local p
+      while IFS= read -r p; do
+        cc_is_alive "$p" || continue
+        echo "killing $p + descendants..."
+        cc_kill_tree "$p" "$grace" || rc=1
+        cc_history_append killed "$target" "$p" "" "user-kill-session" "" 2>/dev/null || true
+      done <<< "$roots"
+      # If everything is gone, drop the tracking file.
+      if [ -z "$(cc_session_live_pids "$target")" ]; then
+        cc_session_delete "$target"
+      fi
+      ;;
+    orphans)
+      local id
+      while IFS= read -r id; do
+        [ -z "$id" ] && continue
+        local claude_pid; claude_pid=$(cc_session_claude_pid "$id")
+        cc_is_claude_alive "$claude_pid" && continue
+        local roots; roots=$(cc_session_all_pids "$id")
+        local p
+        while IFS= read -r p; do
+          cc_is_alive "$p" || continue
+          echo "killing orphan $p + descendants (session $(cc_short_id "$id"))..."
+          cc_kill_tree "$p" "$grace" || rc=1
+          cc_history_append killed "$id" "$p" "" "orphan-kill" "" 2>/dev/null || true
+        done <<< "$roots"
+        [ -z "$(cc_session_live_pids "$id")" ] && cc_session_delete "$id"
+      done < <(cc_session_list)
+      ;;
+    all)
+      # Nuclear option: every tracked tree across every session.
+      local id count=0
+      while IFS= read -r id; do
+        [ -z "$id" ] && continue
+        local roots; roots=$(cc_session_all_pids "$id")
+        local p
+        while IFS= read -r p; do
+          cc_is_alive "$p" || continue
+          echo "killing $p + descendants (session $(cc_short_id "$id"))..."
+          cc_kill_tree "$p" "$grace" || rc=1
+          cc_history_append killed "$id" "$p" "" "user-kill-all" "" 2>/dev/null || true
+          count=$((count + 1))
+        done <<< "$roots"
+        [ -z "$(cc_session_live_pids "$id")" ] && cc_session_delete "$id"
+      done < <(cc_session_list)
+      echo "killed $count tracked process tree(s)"
+      ;;
+  esac
+  return $rc
+}
+
+cc_usage_kill() {
+  cat <<'EOF'
+Usage:
+  shepherd kill                  Kill the latest tracked process tree
+                                         (most recent started_at, still alive).
+  shepherd kill <pid>            Kill one process and its descendants.
+  shepherd kill --latest         Same as bare `kill`.
+  shepherd kill --session <id>   Kill all tracked processes for a session.
+  shepherd kill --orphans        Kill every orphaned process tree.
+  shepherd kill --all            Kill every tracked process tree in
+                                         every session (nuclear option).
+
+Options:
+  --grace <seconds>  Seconds to wait after SIGTERM before SIGKILL (default 3).
+EOF
+}
+
+# ---- subcommand: adopt -----------------------------------------------------
+# Register an externally-spawned pid as tracked in the current Claude session.
+# Covers the gap where a process:
+#  - survived a Claude Code restart (new session can't see old tracked state)
+#  - was unstash'd in a pre-0.5.1 version that didn't auto-attach
+#  - was launched outside Claude entirely but you want to manage it
+
+cmd_adopt() {
+  local pid="" cmd_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        cat <<'EOF'
+Usage: shepherd adopt <pid> [command-label]
+
+Register an externally-spawned pid (and its descendants) as tracked in the
+current Claude session. Afterwards it shows up in `list`, can be stash'd,
+killed via `kill --session`, etc.
+
+  command-label (optional): string to store as the command for this entry.
+  Defaults to the output of `ps -wwo command= -p <pid>`.
+EOF
+        return 0 ;;
+      -*) echo "adopt: unknown flag: $1" >&2; return 2 ;;
+      *) if [ -z "$pid" ]; then pid="$1"; else cmd_override="$1"; fi; shift ;;
+    esac
+  done
+
+  [ -z "$pid" ] && { echo "usage: shepherd adopt <pid> [command-label]" >&2; return 2; }
+  case "$pid" in *[!0-9]*) echo "adopt: pid must be numeric" >&2; return 2 ;; esac
+  cc_is_alive "$pid" || { echo "pid $pid is not alive" >&2; return 1; }
+  cc_have_jq || { echo "shepherd: jq required" >&2; return 1; }
+
+  local cur; cur=$(cc_discover_current_session)
+  if [ -z "$cur" ]; then
+    echo "no active Claude session detected — adopt only works inside a Claude session" >&2
+    return 1
+  fi
+
+  local cmd="$cmd_override"
+  if [ -z "$cmd" ]; then
+    cmd=$(ps -wwo command= -p "$pid" 2>/dev/null | sed 's/^ *//')
+  fi
+  [ -z "$cmd" ] && cmd="adopted-pid-$pid"
+
+  local desc=()
+  local d
+  while IFS= read -r d; do
+    [ -n "$d" ] && desc+=("$d")
+  done < <(cc_descendants "$pid")
+
+  cc_session_add_spawn "$cur" "$pid" "$cmd" "" ${desc[@]+"${desc[@]}"} 2>/dev/null || {
+    echo "failed to record pid in session state" >&2; return 1
+  }
+  cc_history_append spawned "$cur" "$pid" "$cmd" "adopted" "" 2>/dev/null || true
+
+  echo "adopted pid $pid into session $(cc_short_id "$cur")"
+  echo "  command: $cmd"
+  [ "${#desc[@]}" -gt 0 ] && echo "  + ${#desc[@]} descendant pid(s) captured"
+}
+
+# ---- subcommand: cleanup ---------------------------------------------------
+
+cmd_cleanup() {
+  local older_than="" over_ram="" dry_run=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --older-than)   older_than="$2"; shift 2 ;;
+      --older-than=*) older_than="${1#--older-than=}"; shift ;;
+      --over-ram)     over_ram="$2"; shift 2 ;;
+      --over-ram=*)   over_ram="${1#--over-ram=}"; shift ;;
+      --dry-run)      dry_run=1; shift ;;
+      -h|--help)      cc_usage_cleanup; return 0 ;;
+      *) echo "shepherd cleanup: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+
+  # Bare `cleanup` → safe preview: dry-run things older than 24h.
+  if [ -z "$older_than" ] && [ -z "$over_ram" ]; then
+    older_than="24h"
+    dry_run=1
+    echo "(no filters given — defaulting to: --older-than 24h --dry-run)"
+  fi
+
+  local age_secs=0 ram_kb=0
+  if [ -n "$older_than" ]; then
+    age_secs=$(cc_parse_duration "$older_than")
+    [ -z "$age_secs" ] && { echo "bad --older-than: $older_than" >&2; return 2; }
+  fi
+  if [ -n "$over_ram" ]; then
+    ram_kb=$(cc_parse_ram_size "$over_ram")
+    [ -z "$ram_kb" ] && { echo "bad --over-ram: $over_ram" >&2; return 2; }
+  fi
+
+  cc_have_jq || { echo "jq required" >&2; return 1; }
+  cc_config_init
+
+  local matches=()
+  local s
+  while IFS= read -r s; do
+    [ -z "$s" ] && continue
+    local pids; pids=$(cc_session_live_pids "$s")
+    [ -z "$pids" ] && continue
+    local p
+    while IFS= read -r p; do
+      [ -z "$p" ] && continue
+      local info; info=$(cc_process_info "$p")
+      [ -z "$info" ] && continue
+      local rss etime
+      IFS=$'\t' read -r _ _ rss etime _ <<< "$info"
+      local process_secs; process_secs=$(cc_etime_to_seconds "$etime")
+      local keep=1
+      [ "$age_secs" -gt 0 ] && { [ -z "$process_secs" ] && keep=0; [ -n "$process_secs" ] && [ "$process_secs" -lt "$age_secs" ] && keep=0; }
+      [ "$ram_kb" -gt 0 ] && [ "$rss" -lt "$ram_kb" ] && keep=0
+      [ "$keep" -eq 1 ] && matches+=("$s|$p|$rss|$etime")
+    done <<< "$pids"
+  done < <(cc_session_list)
+
+  if [ "${#matches[@]}" -eq 0 ]; then
+    echo "no processes match the filters"
+    return 0
+  fi
+
+  echo "matching processes:"
+  local m
+  for m in "${matches[@]}"; do
+    local ss pp rr ee
+    IFS='|' read -r ss pp rr ee <<< "$m"
+    local cmd; cmd=$(ps -o command= -p "$pp" 2>/dev/null | head -c 60 | sed 's/^ *//')
+    printf '  %s  pid %-6s  %-7s  %-5s  %s\n' \
+      "$(cc_short_id "$ss")" "$pp" \
+      "$(cc_format_rss "$rr")" "$(cc_format_etime "$ee")" "$cmd"
+  done
+  echo
+
+  if [ "$dry_run" -eq 1 ]; then
+    echo "(dry-run — nothing killed)"
+    return 0
+  fi
+
+  if [ -r /dev/tty ]; then
+    printf 'kill these %d process tree(s)? [y/N] ' "${#matches[@]}" > /dev/tty
+    local ans; read -r ans < /dev/tty
+    case "$ans" in y|Y|yes|YES) ;; *) echo "aborted"; return 0 ;; esac
+  else
+    echo "no tty — refusing to kill unconfirmed. Re-run with --dry-run, or with a tty." >&2
+    return 1
+  fi
+
+  local grace; grace=$(cc_config_get '.kill.grace_seconds' 3)
+  local reason="cleanup"
+  [ -n "$older_than" ] && reason="cleanup-older-${older_than}"
+  [ -n "$over_ram"   ] && reason="${reason}-overram-${over_ram}"
+  local killed=0
+  for m in "${matches[@]}"; do
+    local ss pp rr
+    IFS='|' read -r ss pp rr _ <<< "$m"
+    cc_is_alive "$pp" || continue
+    echo "killing $pp ($(cc_short_id "$ss"))..."
+    cc_kill_tree "$pp" "$grace" || true
+    cc_history_append killed "$ss" "$pp" "" "$reason" "$rr" 2>/dev/null || true
+    killed=$((killed + 1))
+  done
+  echo "killed $killed process tree(s)"
+}
+
+cc_usage_cleanup() {
+  cat <<'EOF'
+Usage:
+  shepherd cleanup                      Default preview: --older-than 24h --dry-run.
+  shepherd cleanup --older-than <dur>   Kill tracked processes older than <dur>.
+  shepherd cleanup --over-ram <size>    Kill tracked processes using > <size> RAM.
+  shepherd cleanup --older-than <dur> --over-ram <size> --dry-run
+
+<dur>  30s | 15m | 4h | 2d | N (seconds)
+<size> 512KB | 2MB | 4GB | N (KB)
+
+Prompts for y/N on TTY before killing. --dry-run previews the match.
+EOF
+}
+
+# ---- subcommand: digest ----------------------------------------------------
+
+cmd_digest() {
+  local since="7d"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --since)   since="$2"; shift 2 ;;
+      --since=*) since="${1#--since=}"; shift ;;
+      -h|--help) cc_usage_digest; return 0 ;;
+      *) echo "shepherd digest: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+
+  cc_have_jq || { echo "jq required" >&2; return 1; }
+  cc_config_init
+
+  local enabled; enabled=$(cc_config_get '.digest.enabled' false)
+  if [ "$enabled" != "true" ]; then
+    cat <<EOF
+shepherd digest is opt-in. Turn it on with:
+
+  jq '.digest.enabled = true' ~/.claude/.clean/config.json > /tmp/c && \\
+      mv /tmp/c ~/.claude/.clean/config.json
+
+Then:  shepherd digest --since 7d
+EOF
+    return 0
+  fi
+
+  local since_secs; since_secs=$(cc_parse_duration "$since")
+  [ -z "$since_secs" ] && { echo "bad --since: $since" >&2; return 2; }
+
+  # BSD date (macOS) vs GNU date (Linux) — try both.
+  local cutoff
+  cutoff=$(date -u -v "-${since_secs}S" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+           || date -u -d "-$since_secs seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+  [ -z "$cutoff" ] && { echo "unable to compute cutoff timestamp" >&2; return 1; }
+
+  local h; h=$(cc_history_file)
+  local files=()
+  [ -f "$h"         ] && files+=("$h")
+  [ -f "${h}.old"   ] && files+=("${h}.old")
+  if [ "${#files[@]}" -eq 0 ]; then
+    echo "no history yet at $h"
+    return 0
+  fi
+
+  local stats
+  stats=$(cat "${files[@]}" 2>/dev/null | \
+    jq -s --arg cutoff "$cutoff" '
+      map(select(.ts >= $cutoff))
+      | {
+          total:    length,
+          sessions: (map(.session_id) | unique | length),
+          spawned:  (map(select(.event == "spawned"))  | length),
+          killed:   (map(select(.event == "killed"))   | length),
+          orphaned: (map(select(.event == "orphaned")) | length),
+          stashed:  (map(select(.event == "stashed"))  | length),
+          resumed:  (map(select(.event == "resumed"))  | length),
+          killed_ram_kb: (map(select(.event == "killed") | .ram_kb // 0) | add // 0)
+        }')
+
+  local total; total=$(echo "$stats" | jq -r '.total')
+  if [ "$total" = "0" ]; then
+    echo "no events in the last $since"
+    return 0
+  fi
+
+  local mb; mb=$(echo "$stats" | jq -r '(.killed_ram_kb / 1024 | floor)')
+  echo "shepherd digest (last $since):"
+  echo "$stats" | jq -r '
+    "  total events:   \(.total)",
+    "  sessions:       \(.sessions)",
+    "  spawned:        \(.spawned)",
+    "  killed:         \(.killed)",
+    "  orphaned:       \(.orphaned)",
+    "  stashed:        \(.stashed)",
+    "  resumed:        \(.resumed)"
+  '
+  echo "  RAM freed (est, from killed events with ram_kb): ${mb} MB"
+}
+
+cc_usage_digest() {
+  cat <<'EOF'
+Usage: shepherd digest [--since <dur>]
+
+Aggregate events from ~/.claude/.clean/history.jsonl since <dur> ago.
+Opt-in via config.digest.enabled (default false).
+EOF
+}
+
+# ---- subcommand: stash / unstash -------------------------------------------
+
+cmd_stash() {
+  # Sub-subcommands: list, rm
+  if [ "${1:-}" = "list" ]; then shift; cc_stash_list "$@"; return; fi
+  if [ "${1:-}" = "rm" ]; then shift; cmd_stash_rm "$@"; return $?; fi
+
+  local mode="" target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session)   mode="session"; target="$2"; shift 2 ;;
+      --session=*) mode="session"; target="${1#--session=}"; shift ;;
+      --current)   mode="current"; shift ;;
+      -h|--help)   cc_usage_stash; return 0 ;;
+      -*) echo "shepherd stash: unknown flag: $1" >&2; return 2 ;;
+      *)  mode="pid"; target="$1"; shift ;;
+    esac
+  done
+
+  cc_have_jq || { echo "shepherd: jq required" >&2; return 1; }
+  cc_config_init
+
+  local ids=()
+  case "$mode" in
+    pid)
+      [ -z "$target" ] && { cc_usage_stash; return 2; }
+      local id; id=$(cc_stash_kill_target "$target") || return 1
+      ids+=("$id")
+      ;;
+    session)
+      [ -z "$target" ] && { cc_usage_stash; return 2; }
+      local roots; roots=$(cc_session_all_pids "$target")
+      [ -z "$roots" ] && { echo "no tracked processes for session $target"; return 0; }
+      local p
+      while IFS= read -r p; do
+        cc_is_alive "$p" || continue
+        local id; id=$(cc_stash_kill_target "$p") && ids+=("$id")
+      done <<< "$roots"
+      # Keep the session file — it may still be an active Claude session.
+      # Empty spawned[] is fine; subsequent hooks can re-populate.
+      ;;
+    current)
+      local session; session=$(cc_discover_current_session)
+      [ -z "$session" ] && { echo "no active Claude session detected" >&2; return 1; }
+      local roots; roots=$(cc_session_all_pids "$session")
+      [ -z "$roots" ] && { echo "session $session has no tracked processes"; return 0; }
+      local p
+      while IFS= read -r p; do
+        cc_is_alive "$p" || continue
+        local id; id=$(cc_stash_kill_target "$p") && ids+=("$id")
+      done <<< "$roots"
+      # Don't delete the session file — Claude is still running it. Without
+      # this, /shepherd:unstash --attach loses its target session.
+      ;;
+    *) cc_usage_stash; return 2 ;;
+  esac
+
+  if [ "${#ids[@]}" -gt 0 ]; then
+    echo "stashed ${#ids[@]} process tree(s):"
+    printf '  %s\n' "${ids[@]}"
+    echo "resume with: shepherd unstash <stash_id>"
+  else
+    echo "nothing stashed"
+  fi
+}
+
+cmd_unstash() {
+  local target="" attach="" use_latest=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --attach)  attach="--attach"; shift ;;
+      --latest)  use_latest=1; shift ;;
+      -h|--help) cc_usage_unstash; return 0 ;;
+      -*) echo "shepherd unstash: unknown flag: $1" >&2; return 2 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+
+  cc_have_jq || { echo "shepherd: jq required" >&2; return 1; }
+
+  if [ "$use_latest" -eq 1 ]; then
+    [ -n "$target" ] && { echo "unstash: --latest and explicit id are mutually exclusive" >&2; return 2; }
+    target=$(cc_stash_latest)
+    [ -z "$target" ] && { echo "no stashes to resume"; return 0; }
+    echo "(latest stash: $target)"
+  fi
+  [ -z "$target" ] && { cc_usage_unstash; return 2; }
+
+  # CC_RESPAWN_ATTACHED_TO is set by cc_respawn — empty means attach failed.
+  export CC_RESPAWN_ATTACHED_TO=""
+  local new_pid; new_pid=$(cc_respawn "$target" "$attach") || return 1
+  # cc_respawn ran in a subshell — re-read its side-effect from state.
+  # We cache it in a temp file as an extra channel since exports don't flow up.
+  echo "resumed: pid $new_pid"
+  if [ -n "$attach" ]; then
+    # Re-check directly: did the new pid land in a tracked session?
+    local found_in=""
+    local s
+    while IFS= read -r s; do
+      [ -z "$s" ] && continue
+      if cc_session_all_pids "$s" | grep -qFx "$new_pid"; then
+        found_in="$s"; break
+      fi
+    done < <(cc_session_list)
+    if [ -n "$found_in" ]; then
+      echo "attached to session $(cc_short_id "$found_in")"
+    else
+      echo "⚠ --attach requested but no tracked session matched — pid $new_pid is NOT tracked"
+      echo "  (fix: /shepherd:adopt $new_pid)"
+    fi
+  fi
+  echo "logs: /tmp/shepherd-${target}.log"
+}
+
+cmd_stash_rm() {
+  local mode="" target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)    mode="all"; shift ;;
+      --latest) mode="latest"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  shepherd stash rm <stash_id>   Remove one snapshot.
+  shepherd stash rm --latest     Remove the most recent snapshot.
+  shepherd stash rm --all        Remove every snapshot.
+EOF
+        return 0 ;;
+      -*) echo "stash rm: unknown flag: $1" >&2; return 2 ;;
+      *) mode="id"; target="$1"; shift ;;
+    esac
+  done
+
+  cc_have_jq || { echo "shepherd: jq required" >&2; return 1; }
+
+  case "$mode" in
+    id)
+      [ -z "$target" ] && { echo "stash rm: stash_id required" >&2; return 2; }
+      cc_stash_rm "$target" && echo "removed: $target"
+      ;;
+    latest)
+      local id; id=$(cc_stash_latest)
+      [ -z "$id" ] && { echo "no stashes to remove"; return 0; }
+      cc_stash_rm "$id" && echo "removed: $id (latest)"
+      ;;
+    all)
+      local n; n=$(cc_stash_rm_all)
+      echo "removed $n snapshot(s)"
+      ;;
+    "")
+      # Bare `stash rm` → --latest (same default as slash command).
+      local id; id=$(cc_stash_latest)
+      [ -z "$id" ] && { echo "no stashes to remove"; return 0; }
+      cc_stash_rm "$id" && echo "removed: $id (latest)"
+      ;;
+    *) echo "stash rm: need <id>, --latest, or --all" >&2; return 2 ;;
+  esac
+}
+
+cc_usage_stash() {
+  cat <<'EOF'
+Usage:
+  shepherd stash <pid>               Stash a specific pid + descendants.
+  shepherd stash --session <id>      Stash all processes of a session.
+  shepherd stash --current           Stash this Claude session's processes.
+  shepherd stash list                Show available snapshots.
+  shepherd stash rm <id|--latest|--all>
+                                             Delete a snapshot without respawning.
+
+Stash snapshots command, cwd, and allowlisted env vars to
+~/.claude/.processes/stashed/<id>.json, then kills the tree.
+Resume with `shepherd unstash <id>` (or --latest).
+EOF
+}
+
+cc_usage_unstash() {
+  cat <<'EOF'
+Usage:
+  shepherd unstash <stash_id>              Respawn in original cwd.
+  shepherd unstash --latest                Respawn the most recent stash.
+  shepherd unstash <id|--latest> --attach  Also register with the
+                                                   current Claude session.
+EOF
+}
+
+# ---- subcommand: prompt (internal, called by Stop hook) ---------------------
+
+cmd_prompt() {
+  local id="$1"
+  [ -z "$id" ] && { echo "shepherd prompt: session id required" >&2; return 2; }
+  cc_state_init
+  cc_have_jq || { echo "shepherd: jq is required" >&2; return 1; }
+
+  local live_pids; live_pids=$(cc_session_live_pids "$id")
+  if [ -z "$live_pids" ]; then
+    cc_session_delete "$id"
+    return 0
+  fi
+
+  echo "Claude session $(cc_short_id "$id") ended. These processes are still running:"
+  local p
+  while IFS= read -r p; do cc_print_process_line "$p"; done <<< "$live_pids"
+  echo
+  # Read from /dev/tty — hook stdin is attached to Claude.
+  if [ -r /dev/tty ]; then
+    printf 'Kill them all? [y/N] ' > /dev/tty
+    local ans
+    read -r ans < /dev/tty
+    case "$ans" in
+      y|Y|yes|YES) cmd_kill --session "$id" ;;
+      *) echo "leaving them alive. Run: shepherd list    to see them later." ;;
+    esac
+  else
+    echo "(no tty — skipping confirmation; run 'shepherd kill --session $id' to terminate)"
+  fi
+}
+
+# ---- subcommand: hook (entry point for Claude Code hooks) -------------------
+#
+# Invoked by the small wrapper scripts under hooks/. Reads a JSON event from
+# stdin and updates tracking state. All errors are swallowed — a failing hook
+# must never block Claude.
+
+cmd_hook() {
+  local sub="${1:-}"; [ $# -gt 0 ] && shift
+  case "$sub" in
+    session-start)       hook_session_start       "$@" ;;
+    pre-tool-use)        hook_pre_tool_use        "$@" ;;
+    post-tool-use)       hook_post_tool_use       "$@" ;;
+    user-prompt-submit)  hook_user_prompt_submit  "$@" ;;
+    stop)                hook_stop                "$@" ;;
+    '') echo "shepherd hook: subcommand required (session-start|pre-tool-use|post-tool-use|user-prompt-submit|stop)" >&2; return 2 ;;
+    *) echo "shepherd hook: unknown sub: $sub" >&2; return 2 ;;
+  esac
+}
+
+# Read event JSON from stdin, deadline 2s so a stuck hook can't hang Claude.
+cc_read_event() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 2 cat
+  else
+    # bash has a read-with-timeout; use it as a fallback
+    local line out=""
+    while IFS= read -r -t 2 line; do out+="$line"$'\n'; done
+    printf '%s' "$out"
+  fi
+}
+
+hook_session_start() {
+  cc_have_jq || return 0
+  local event; event=$(cc_read_event)
+  [ -z "$event" ] && return 0
+  local session_id cwd
+  session_id=$(jq -r '.session_id // empty' <<< "$event" 2>/dev/null)
+  cwd=$(jq -r '.cwd // empty' <<< "$event" 2>/dev/null)
+  [ -z "$session_id" ] && return 0
+  cc_session_init "$session_id" "$PPID" "$cwd" 2>/dev/null || true
+  cc_touch_current "$session_id"
+
+  # Auto-clean orphans from previous Claude instances that crashed without
+  # firing Stop. Default ON — orphans (claude_pid dead but children alive)
+  # are by definition leftovers from a crash. Graceful /exit flows through
+  # the Stop hook, which warns the user to stash/kill; anyone who wanted
+  # to preserve a dev server would have stashed. Concurrent Claude sessions
+  # aren't affected (their claude_pid is alive → not orphans).
+  # Disable:
+  #   jq '.kill.auto_orphans_on_session_start = false' \
+  #     ~/.claude/.shepherd/config.json > /tmp/c && mv /tmp/c ~/.claude/.shepherd/config.json
+  local auto_kill
+  auto_kill=$(cc_config_get '.kill.auto_orphans_on_session_start' false)
+  if [ "$auto_kill" = "true" ]; then
+    local killed_lines=""
+    local killed_count=0
+    local s
+    while IFS= read -r s; do
+      [ -z "$s" ] && continue
+      [ "$s" = "$session_id" ] && continue
+      local cp; cp=$(cc_session_claude_pid "$s")
+      cc_is_claude_alive "$cp" && continue
+      local p
+      while IFS= read -r p; do
+        cc_is_alive "$p" || continue
+        local ps_cmd; ps_cmd=$(ps -o command= -p "$p" 2>/dev/null | head -c 60 | sed 's/^ *//')
+        cc_kill_tree "$p" 1 2>/dev/null || true
+        cc_history_append killed "$s" "$p" "" "auto-kill-on-session-start" "" 2>/dev/null || true
+        killed_lines+="  pid $p  $ps_cmd  (session ${s:0:6})"$'\n'
+        killed_count=$((killed_count + 1))
+      done < <(cc_session_all_pids "$s")
+      [ -z "$(cc_session_live_pids "$s")" ] && cc_session_delete "$s"
+    done < <(cc_session_list)
+
+    if [ "$killed_count" -gt 0 ]; then
+      {
+        printf 'shepherd auto-cleanup: killed %d orphan tree(s) from previous session(s):\n' "$killed_count"
+        printf '%s' "$killed_lines"
+      } | cc_emit_context SessionStart
+    fi
+  fi
+  return 0
+}
+
+hook_pre_tool_use() {
+  cc_have_jq || return 0
+  local event; event=$(cc_read_event)
+  [ -z "$event" ] && return 0
+  local session_id; session_id=$(jq -r '.session_id // empty' <<< "$event" 2>/dev/null)
+  [ -n "$session_id" ] && cc_touch_current "$session_id"
+  local tool_name command
+  tool_name=$(jq -r '.tool_name // empty' <<< "$event" 2>/dev/null)
+  [ -n "$tool_name" ] && [ "$tool_name" != "Bash" ] && return 0
+  command=$(jq -r '.tool_input.command // ""' <<< "$event" 2>/dev/null)
+  [ -z "$command" ] && return 0
+
+  local warnings; warnings=$(cc_port_conflict_check "$command" 2>/dev/null | awk 'NF')
+  if [ -n "$warnings" ]; then
+    printf '%s\n' "$warnings" | cc_emit_context PreToolUse
+  fi
+  return 0
+}
+
+hook_post_tool_use() {
+  cc_have_jq || return 0
+  local event; event=$(cc_read_event)
+  [ -z "$event" ] && return 0
+  local session_id tool_name
+  session_id=$(jq -r '.session_id // empty' <<< "$event" 2>/dev/null)
+  tool_name=$(jq -r '.tool_name // empty' <<< "$event" 2>/dev/null)
+  [ -z "$session_id" ] && return 0
+  cc_touch_current "$session_id"
+  # settings.json already filters by Bash matcher; this is defense-in-depth.
+  [ -n "$tool_name" ] && [ "$tool_name" != "Bash" ] && return 0
+
+  # Resolve claude_pid. Prefer state file (set at SessionStart); fall back to
+  # this hook's PPID if the session wasn't initialised.
+  local claude_pid
+  claude_pid=$(cc_session_claude_pid "$session_id" 2>/dev/null)
+  [ -z "$claude_pid" ] && claude_pid="$PPID"
+
+  # If the session file doesn't exist yet (user installed mid-session), create
+  # it lazily so PostToolUse can proceed.
+  if ! [ -f "$(cc_session_file "$session_id")" ]; then
+    local cwd; cwd=$(jq -r '.cwd // empty' <<< "$event" 2>/dev/null)
+    cc_session_init "$session_id" "$claude_pid" "$cwd" 2>/dev/null || return 0
+  fi
+
+  cc_is_claude_alive "$claude_pid" || return 0
+
+  local existing; existing=$(cc_session_all_pids "$session_id" | sort -u)
+  local command
+  command=$(jq -r '.tool_input.command // ""' <<< "$event" 2>/dev/null)
+  # Full command retained — stash/resume needs the exact string to respawn.
+
+  # Self-filter: don't track invocations of our own CLI. Without this, a
+  # /shepherd:processes slash command would leave a ghost "claude-
+  # processes list" wrapper in the session's spawned[] and show up in
+  # stash --current. Matches shepherd as a word (whole path OK).
+  if echo "$command" | grep -qE '(^|[^A-Za-z0-9_-])shepherd([[:space:]]|$)'; then
+    return 0
+  fi
+
+  # Record only Bash-tool wrappers as spawns. Two filters stacked:
+  #   (a) direct children of claude_pid — wrappers correspond 1:1 with a
+  #       Bash tool call, walking all descendants mis-attributed commands
+  #       from an earlier call to a later one (fixed earlier).
+  #   (b) the process's argv still contains the shell-snapshot signature —
+  #       the kernel-visible marker of our wrapper. Claude Code also
+  #       direct-spawns internal helpers (caffeinate for keep-awake, MCP
+  #       servers, etc.) which we should NEVER treat as user workloads.
+  local kid
+  while IFS= read -r kid; do
+    [ -z "$kid" ] && continue
+    if printf '%s\n' "$existing" | grep -qFx "$kid"; then continue; fi
+    cc_is_alive "$kid" || continue
+    [ "$kid" = "$$" ] && continue
+    # Filter (b): must look like our bash-tool wrapper.
+    local kid_cmd; kid_cmd=$(ps -wwo command= -p "$kid" 2>/dev/null)
+    case "$kid_cmd" in
+      *"$CC_WRAPPER_SIGNATURE"*) ;;
+      *) continue ;;
+    esac
+    # Descendants of this wrapper form the subtree.
+    local kid_children=()
+    local c
+    while IFS= read -r c; do
+      [ -n "$c" ] && kid_children+=("$c")
+    done < <(cc_descendants "$kid")
+    cc_session_add_spawn "$session_id" "$kid" "$command" "" ${kid_children[@]+"${kid_children[@]}"} 2>/dev/null || true
+    cc_history_append spawned "$session_id" "$kid" "$command" "" "" 2>/dev/null || true
+  done < <(cc_children "$claude_pid")
+
+  # Awareness: RAM-threshold check, emit contextual nudge if any tracked pid
+  # just crossed the threshold. Rate-limited per pid.
+  local ram_warnings; ram_warnings=$(cc_ram_threshold_check "$session_id" 2>/dev/null | awk 'NF')
+  if [ -n "$ram_warnings" ]; then
+    printf '%s\n' "$ram_warnings" | cc_emit_context PostToolUse
+  fi
+
+  return 0
+}
+
+hook_stop() {
+  cc_have_jq || return 0
+  local event; event=$(cc_read_event)
+  [ -z "$event" ] && return 0
+  local session_id
+  session_id=$(jq -r '.session_id // empty' <<< "$event" 2>/dev/null)
+  [ -z "$session_id" ] && return 0
+  cc_touch_current "$session_id"
+
+  local live_pids; live_pids=$(cc_session_live_pids "$session_id")
+  if [ -z "$live_pids" ]; then
+    cc_session_delete "$session_id"
+    return 0
+  fi
+
+  # Emit via additionalContext so Claude sees the state in-context and can
+  # proactively offer to stash/kill rather than the user having to remember.
+  local summary
+  summary=$(
+    printf 'Background processes still running in this session:\n'
+    local p
+    while IFS= read -r p; do
+      local info; info=$(cc_process_info "$p" 2>/dev/null)
+      [ -z "$info" ] && continue
+      local cmd rss etime ports
+      IFS=$'\t' read -r _ cmd rss etime ports <<< "$info"
+      printf '  pid %s  %s  %s  %s\n' "$p" "$(cc_format_rss "$rss")" "$(cc_format_etime "$etime")" "$cmd"
+    done <<< "$live_pids"
+    printf 'Suggest: shepherd stash --session %s    (preserve + free RAM)\n' "$session_id"
+    printf 'Or:      shepherd kill --session %s     (terminate)\n' "$session_id"
+  )
+  printf '%s\n' "$summary" | cc_emit_context Stop
+  return 0
+}
+
+hook_user_prompt_submit() {
+  cc_have_jq || return 0
+  local event; event=$(cc_read_event)
+  [ -z "$event" ] && return 0
+  local prompt session_id
+  prompt=$(jq -r '.prompt // empty' <<< "$event" 2>/dev/null)
+  session_id=$(jq -r '.session_id // empty' <<< "$event" 2>/dev/null)
+  [ -z "$prompt" ] && return 0
+  [ -z "$session_id" ] && return 0
+  cc_touch_current "$session_id"
+
+  # Only intervene when the prompt looks like a session-reset: /clear, /new,
+  # or conversational "start fresh" / "new session" patterns.
+  local match=0
+  case "$prompt" in
+    /clear*|/new*) match=1 ;;
+  esac
+  if [ "$match" -eq 0 ]; then
+    case "$(echo "$prompt" | tr '[:upper:]' '[:lower:]')" in
+      *"start fresh"*|*"new session"*|*"reset context"*|*"clear context"*) match=1 ;;
+    esac
+  fi
+  [ "$match" -eq 0 ] && return 0
+
+  local live_pids; live_pids=$(cc_session_live_pids "$session_id" 2>/dev/null)
+  [ -z "$live_pids" ] && return 0
+  local count; count=$(printf '%s\n' "$live_pids" | awk 'NF' | wc -l | tr -d ' ')
+  [ "$count" -eq 0 ] && return 0
+
+  local msg
+  msg=$(
+    printf '%s tracked background process(es) will be orphaned by this reset.\n' "$count"
+    local p
+    while IFS= read -r p; do
+      local info; info=$(cc_process_info "$p" 2>/dev/null)
+      [ -z "$info" ] && continue
+      local cmd rss
+      IFS=$'\t' read -r _ cmd rss _ _ <<< "$info"
+      printf '  pid %s  %s  %s\n' "$p" "$(cc_format_rss "$rss")" "$cmd"
+    done <<< "$live_pids"
+    printf 'To preserve them: shepherd stash --session %s\n' "$session_id"
+    printf 'Then resume later with: shepherd unstash --latest\n'
+  )
+  printf '%s\n' "$msg" | cc_emit_context UserPromptSubmit
+  return 0
+}
+
+# ---- subcommand: sessions (diagnostic) --------------------------------------
+
+cmd_sessions() {
+  cc_state_init
+  local id
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    local pid; pid=$(cc_session_claude_pid "$id")
+    local alive="dead"
+    cc_is_claude_alive "$pid" && alive="alive"
+    printf '%s  claude=%s (%s)  %s\n' "$id" "$pid" "$alive" "$(cc_session_cwd "$id")"
+  done < <(cc_session_list)
+}
+
+# ---- top-level dispatch -----------------------------------------------------
+
+cc_usage() {
+  cat <<EOF
+shepherd $CC_VERSION — inspect and kill Claude-spawned background processes.
+
+Commands:
+  list [--session <id>] [--orphans]   Show tracked processes.
+  status                              One-line summary.
+  kill <pid>                          Terminate a pid + descendants.
+  kill --session <id>                 Terminate everything a session spawned.
+  kill --orphans                      Terminate all orphaned trees.
+  stash <target>                      Snapshot + kill (see stash --help).
+  stash list                          Show available snapshots.
+  stash rm <id|--latest|--all>        Delete a snapshot without resuming.
+  unstash <id|--latest>               Respawn a stashed process.
+  adopt <pid> [label]                 Track an externally-spawned pid.
+  cleanup --older-than <dur>          Kill old processes (see cleanup --help).
+  cleanup --over-ram <size>           Kill RAM-heavy processes.
+  digest [--since <dur>]              Aggregate history.jsonl (opt-in).
+  sessions                            List tracked session IDs.
+  prompt <session_id>                 Print kill summary for one session.
+  hook <event>                        Internal; called by Claude Code hooks.
+  version                             Print version.
+
+Files:
+  Tracking state:  ~/.claude/.clean/<session>.json
+  Hook scripts:    ~/.claude/hooks/shepherd/
+EOF
+}
+
+main() {
+  [ $# -eq 0 ] && { cc_usage; exit 0; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    list)     cmd_list "$@" ;;
+    status)   cmd_status "$@" ;;
+    kill)     cmd_kill "$@" ;;
+    stash)    cmd_stash "$@" ;;
+    unstash)  cmd_unstash "$@" ;;
+    adopt)    cmd_adopt "$@" ;;
+    cleanup)  cmd_cleanup "$@" ;;
+    digest)   cmd_digest "$@" ;;
+    prompt)   cmd_prompt "$@" ;;
+    hook)     cmd_hook "$@" ;;
+    sessions) cmd_sessions "$@" ;;
+    version|-v|--version) echo "shepherd $CC_VERSION" ;;
+    help|-h|--help) cc_usage ;;
+    *) echo "shepherd: unknown command: $cmd" >&2; cc_usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
